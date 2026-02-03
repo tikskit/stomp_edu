@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>STOMP Intro</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+    label { display: grid; gap: 6px; font-size: 14px; }
+    input { padding: 8px 10px; font-size: 14px; min-width: 220px; }
+    button { padding: 10px 14px; font-size: 14px; cursor: pointer; }
+    #status { margin-top: 14px; font-weight: 600; }
+    #log { margin-top: 14px; padding: 12px; background: #0b1020; color: #e6edf3; border-radius: 8px; height: 200px; overflow: auto; }
+    .log-error { color: #ff6b6b; font-weight: bold; }
+    .muted { color: #666; font-size: 12px; margin-top: 6px; }
+    h2 { margin-top: 24px; margin-bottom: 8px; }
+    #chat { width: 100%; height: 200px; padding: 12px; font-family: inherit; font-size: 14px; border: 1px solid #ccc; border-radius: 8px; resize: vertical; }
+  </style>
+</head>
+<body>
+<h1>WebSocket + STOMP</h1>
+
+<div class="row">
+  <label>
+    URL
+    <input id="url" value="ws://localhost:8080/ws" />
+  </label>
+
+  <label>
+    Username
+    <input id="username" value="user1" />
+  </label>
+
+  <label>
+    Password
+    <input id="password" type="password" value="pass" />
+  </label>
+
+  <button id="connect">подключиться</button>
+  <button id="disconnect" disabled>отключиться</button>
+</div>
+
+<div id="status">Статус: не подключено</div>
+<div class="muted">
+  Примечание: STOMP-заголовки (login/passcode) отправляются после WebSocket-handshake.
+  Если на бэке включена Basic Auth на самом эндпоинте <code>/ws</code>, браузер не даст добавить HTTP-заголовок <code>Authorization</code> в handshake из JavaScript.
+</div>
+
+<h2>Отправить сообщение</h2>
+<div class="row">
+  <label>
+    Сообщение
+    <input id="messageInput" placeholder="Введите сообщение..." />
+  </label>
+  <button id="send" disabled>отправить</button>
+</div>
+
+<h2>Сообщения чата (/topic/chat)</h2>
+<textarea id="chat" readonly placeholder="Сообщения из /topic/chat будут отображаться здесь..."></textarea>
+
+<h2>Лог STOMP</h2>
+<pre id="log"></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.0.0/bundles/stomp.umd.min.js"></script>
+<script>
+  /** @type {import('@stomp/stompjs').Client | null} */
+  let client = null;
+  /** @type {import('@stomp/stompjs').StompSubscription[]} */
+  let subscriptions = [];
+
+  const elUrl = document.getElementById('url');
+  const elUsername = document.getElementById('username');
+  const elPassword = document.getElementById('password');
+  const elConnect = document.getElementById('connect');
+  const elDisconnect = document.getElementById('disconnect');
+  const elStatus = document.getElementById('status');
+  const elLog = document.getElementById('log');
+  const elChat = document.getElementById('chat');
+  const elMessageInput = document.getElementById('messageInput');
+  const elSend = document.getElementById('send');
+
+  function setStatus(text) {
+    elStatus.textContent = 'Статус: ' + text;
+  }
+
+  function log(...args) {
+    const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))).join(' ');
+    const ts = new Date().toISOString();
+    const span = document.createElement('span');
+    span.textContent = `[${ts}] ${line}\n`;
+    elLog.appendChild(span);
+    elLog.scrollTop = elLog.scrollHeight;
+  }
+
+  function logError(...args) {
+    const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))).join(' ');
+    const ts = new Date().toISOString();
+    const span = document.createElement('span');
+    span.className = 'log-error';
+    span.textContent = `[${ts}] ❌ ${line}\n`;
+    elLog.appendChild(span);
+    elLog.scrollTop = elLog.scrollHeight;
+  }
+
+  function connect() {
+    if (client && client.active) {
+      log('Уже подключено/подключается.');
+      return;
+    }
+
+    const url = elUrl.value.trim();
+    const username = elUsername.value;
+    const password = elPassword.value;
+
+    log('Подключаемся к', url);
+    setStatus('подключение...');
+
+    client = new StompJs.Client({
+      brokerURL: url,
+      reconnectDelay: 0,
+      connectHeaders: {
+        login: username,
+        passcode: password,
+      },
+      debug: (str) => log(str),
+      onConnect: (frame) => {
+        log('STOMP CONNECTED', frame.headers);
+        setStatus('подключено');
+        elConnect.disabled = true;
+        elDisconnect.disabled = false;
+        elSend.disabled = false;
+
+        // Подписка на /topic/chat
+        const chatSub = client.subscribe('/topic/chat', (message) => {
+          try {
+            const chatItem = JSON.parse(message.body);
+            const time = chatItem.timestamp ? new Date(chatItem.timestamp).toLocaleTimeString() : '';
+            const line = `[${time}] ${chatItem.author}: ${chatItem.message}\n`;
+            elChat.value += line;
+            elChat.scrollTop = elChat.scrollHeight;
+          } catch (e) {
+            log('Ошибка парсинга сообщения:', e.message);
+          }
+        });
+        subscriptions.push(chatSub);
+        log('Подписались на /topic/chat');
+
+        // Подписка на пользовательские ошибки
+        const errorsSub = client.subscribe('/user/queue/errors', (message) => {
+          try {
+            const chatError = JSON.parse(message.body);
+            logError(chatError.message);
+          } catch (e) {
+            logError('Ошибка парсинга сообщения об ошибке:', e.message);
+          }
+        });
+        subscriptions.push(errorsSub);
+        log('Подписались на /user/queue/errors');
+      },
+      onStompError: (frame) => {
+        log('STOMP ERROR', frame.headers, frame.body);
+      },
+      onWebSocketError: (evt) => {
+        log('WebSocket error', String(evt));
+      },
+      onWebSocketClose: (evt) => {
+        log('WebSocket closed', { code: evt.code, reason: evt.reason, wasClean: evt.wasClean });
+        setStatus('не подключено');
+        elConnect.disabled = false;
+        elDisconnect.disabled = true;
+        elSend.disabled = true;
+      },
+    });
+
+    client.activate();
+  }
+
+  function disconnect() {
+    if (!client) return;
+    log('Отключаемся...');
+    // Отписываемся от всех подписок
+    subscriptions.forEach(sub => {
+      try {
+        sub.unsubscribe();
+        log('Отписались от', sub.id);
+      } catch (e) {
+        log('Ошибка при отписке:', e.message);
+      }
+    });
+    subscriptions = [];
+    client.deactivate();
+  }
+
+  function sendMessage() {
+    if (!client || !client.active) {
+      log('Не подключено');
+      return;
+    }
+    const text = elMessageInput.value.trim();
+    if (!text) return;
+
+    client.publish({ destination: '/app/chat', body: text });
+    log('Отправлено в /app/chat:', text);
+    elMessageInput.value = '';
+  }
+
+  elConnect.addEventListener('click', connect);
+  elDisconnect.addEventListener('click', disconnect);
+  elSend.addEventListener('click', sendMessage);
+  elMessageInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendMessage();
+  });
+</script>
+</body>
+</html>
